@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>XAUUSD 1H SMC – 5/8 CONFIRM = SIGNAL (Improved)</title>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/ta-lib-wasm@latest/dist/ta-lib.js"></script>
+<style>
+    body{margin:0;background:#000;color:#0f0;font-family:Courier New;}
+    #chart{width:100vw;height:100vh;}
+    .panel{position:fixed;top:10px;left:10px;background:#001100;padding:18px;border:4px solid #0f0;border-radius:12px;z-index:9999;width:380px;}
+    input{width:100%;padding:10px;margin:6px 0;background:#000;color:#0f0;border:2px solid #0f0;border-radius:8px;}
+    button{width:100%;padding:12px;background:#0f0;color:#000;font-weight:bold;border:none;border-radius:10px;cursor:pointer;font-size:16px;}
+    #predict{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-size:48px;padding:26px 60px;border-radius:18px;z-index:99999;display:none;
+           box-shadow:0 0 100px #0f0;text-shadow:0 0 40px #0f0;animation:glow 2s infinite;}
+    @keyframes glow{0%,100%{box-shadow:0 0 100px #0f0;}50%{box-shadow:0 0 150px #0f0;}}
+    .up{background:#001100;border:8px solid #0f0;}
+    .down{background:#110000;border:8px solid #f00;color:#f00;}
+    .status{color:#0f0;margin-top:8px;font-size:14px;}
+    .small{font-size:12px;color:#8f8;}
+</style>
+</head>
+<body>
+
+<div class="panel">
+    <h3>XAUUSD 1H SMC – Improved 5/8 Bot</h3>
+    <input type="text" id="api" placeholder="Twelve Data API Key">
+    <input type="text" id="token" placeholder="Telegram Bot Token">
+    <input type="text" id="chat" placeholder="Telegram Chat ID">
+    <input type="number" id="cool" placeholder="Signal cooldown (minutes) - default 45" value="45">
+    <button onclick="launch()">LAUNCH IMPROVED BOT</button>
+    <div class="status" id="st">Status: Ready</div>
+    <div class="small" id="conf">Improvements: OB refine, FVG depth, BOS/CHOCH, ATR SL/TP, cooldown, retries</div>
+</div>
+
+<div id="predict"></div>
+<div id="chart"></div>
+<audio id="boom" src="https://assets.mixkit.co/sfx/preview/mixkit-arcade-game-explosion-2759.mp3"></audio>
+
+<script>
+const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+    layout: { backgroundColor: '#000', textColor: '#0f0' },
+    grid: { vertLines: { color: '#003300' }, horzLines: { color: '#003300' } },
+});
+const series = chart.addCandlestickSeries({upColor:'#0f0',downColor:'#f00',wickUpColor:'#0f0',wickDownColor:'#f00'});
+
+let cfg = {api:'',token:'',chat:''};
+let lastSignalDir = '', lastSignalTime = 0, lastCandleTime = 0;
+let h1 = [], h4 = [], ohlc = [];
+let cooldownMinutes = 45;
+
+if(localStorage.getItem('xau_58_improved')) {
+    cfg = JSON.parse(localStorage.getItem('xau_58_improved'));
+    document.getElementById('st').textContent = "Improved 5/8 BOT RUNNING (Loaded config)";
+    cooldownMinutes = +localStorage.getItem('xau58_cool') || cooldownMinutes;
+    start();
+}
+
+function launch() {
+    cfg.api = document.getElementById('api').value.trim();
+    cfg.token = document.getElementById('token').value.trim();
+    cfg.chat = document.getElementById('chat').value.trim();
+    cooldownMinutes = parseInt(document.getElementById('cool').value) || cooldownMinutes;
+    if(!cfg.api || !cfg.token || !cfg.chat) return alert("Sab bharo bhai!");
+    localStorage.setItem('xau_58_improved', JSON.stringify(cfg));
+    localStorage.setItem('xau58_cool', cooldownMinutes);
+    document.getElementById('st').textContent = "Improved 5/8 BOT LAUNCHED!";
+    start();
+}
+
+async function start() {
+    await Promise.all([load1H(true), load4H(true)]);
+    setInterval(checkNewCandle, 20000);
+    // initial run for last candle
+    await check5outOf8(true);
+}
+
+async function fetchWithRetry(url, opts={}, retries=3, delay=1200) {
+    for(let i=0;i<retries;i++){
+        try {
+            const res = await fetch(url, opts);
+            if(!res.ok) throw new Error('HTTP ' + res.status);
+            return await res.json();
+        } catch(e) {
+            if(i===retries-1) throw e;
+            await new Promise(r=>setTimeout(r,delay));
+        }
+    }
+}
+
+async function load1H(initial=false) {
+    const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=400&apikey=${cfg.api}`;
+    const j = await fetchWithRetry(url);
+    if(!j.values) throw new Error('Invalid 1H data');
+    h1 = j.values.map(d=>({t:new Date(d.datetime).getTime()/1000, o:+d.open, h:+d.high, l:+d.low, c:+d.close, v:+d.volume})).reverse();
+    series.setData(h1.map(c=>({time:c.t,open:c.o,high:c.h,low:c.l,close:c.c})));
+    if(initial) lastCandleTime = h1[h1.length-1].t;
+}
+
+async function load4H(initial=false) {
+    const url = `https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=4h&outputsize=200&apikey=${cfg.api}`;
+    const j = await fetchWithRetry(url);
+    if(!j.values) throw new Error('Invalid 4H data');
+    h4 = j.values.map(d=>({t:new Date(d.datetime).getTime()/1000, o:+d.open, h:+d.high, l:+d.low, c:+d.close})).reverse();
+}
+
+async function checkNewCandle() {
+    try {
+        const res = await fetchWithRetry(`https://api.twelvedata.com/time_series?symbol=XAU/USD&interval=1h&outputsize=2&apikey=${cfg.api}`);
+        const nt = new Date(res.values[0].datetime).getTime()/1000;
+        const nb = {t:nt, o:+res.values[0].open, h:+res.values[0].high, l:+res.values[0].low, c:+res.values[0].close, v:+res.values[0].volume};
+        if(nt > lastCandleTime) {
+            lastCandleTime = nt;
+            h1.push(nb);
+            if(h1.length>600) h1.shift();
+            series.update({time:nb.t, open:nb.o, high:nb.h, low:nb.l, close:nb.c});
+            // occasionally refresh 4H
+            if(Math.random() < 0.08) await load4H();
+            await check5outOf8();
+        } else {
+            // update current candle values in case volume/price changed
+            series.update({time:nb.t, open:nb.o, high:nb.h, low:nb.l, close:nb.c});
+        }
+    } catch(e) {
+        console.error('checkNewCandle error', e);
+        document.getElementById('st').textContent = "Status: API/Network error (retrying)";
+    }
+}
+
+function mean(arr){return arr.reduce((a,b)=>a+b,0)/arr.length;}
+function sum(arr){return arr.reduce((a,b)=>a+b,0);}
+
+async function check5outOf8(force=false) {
+    if(h1.length < 60) return;
+    // gather needed arrays
+    const closes = h1.map(x=>x.c);
+    const highs = h1.map(x=>x.h);
+    const lows = h1.map(x=>x.l);
+    const volumes = h1.map(x=>x.v);
+
+    // compute indicators with TALib
+    const ema200_4h = (await TALib.EMA({inReal:h4.map(x=>x.c), period:200})).result.slice(-1)[0];
+    const closes50 = closes.slice(-80); // provide enough history
+    const ema9 = (await TALib.EMA({inReal:closes50, period:9})).result.slice(-1)[0];
+    const ema21 = (await TALib.EMA({inReal:closes50, period:21})).result.slice(-1)[0];
+    const rsi = (await TALib.RSI({inReal:closes50, period:14})).result.slice(-1)[0];
+    const atr = (await TALib.ATR({high:highs.slice(-50), low:lows.slice(-50), close:closes.slice(-50), period:14})).result.slice(-1)[0];
+
+    const curr = h1[h1.length-1];
+    const prev = h1[h1.length-2];
+    const prev2 = h1[h1.length-3];
+
+    let score = 0;
+    let direction = '';
+
+    // 1) HTF EMA200 bias
+    if(curr.o > ema200_4h) { score++; direction='UP'; }
+    else if(curr.o < ema200_4h) { score++; direction='DOWN'; }
+
+    // 2) Order Block proximity & strength (improved)
+    const ob = findOBImproved();
+    if(ob) {
+        // if current open inside OB range or within ATR*0.6 distance -> stronger
+        const within = (curr.o >= ob.low && curr.o <= ob.high) || Math.abs(curr.o - ((ob.low+ob.high)/2)) < (atr*0.6);
+        if(within) score++;
+        // add extra weight for deep OB (range > ATR*0.4)
+        if((ob.high - ob.low) > atr*0.4) score++;
+    }
+
+    // 3) FVG with depth (improved)
+    const fvg = findFVGImproved();
+    if(fvg) {
+        // depth normalized by ATR
+        if(fvg.depth/atr > 0.25) score++;
+    }
+
+    // 4) Liquidity Grab detection (sweep of recent extremes)
+    const last10L = Math.min(...h1.slice(-12).map(x=>x.l));
+    const last10H = Math.max(...h1.slice(-12).map(x=>x.h));
+    if(prev.l < last10L * 0.999 && curr.o > prev.l) score++;
+    if(prev.h > last10H * 1.001 && curr.o < prev.h) score++;
+
+    // 5) Volume spike vs rolling average
+    const avgVol = mean(volumes.slice(-30));
+    if(curr.v > avgVol * 1.6) score++;
+
+    // 6) Engulfing / Strong Candle with trend confluence
+    if(direction==='UP' && prev.c < prev.o && curr.c > curr.o && curr.o < prev.c) score++;
+    if(direction==='DOWN' && prev.c > prev.o && curr.c < curr.o && curr.o > prev.c) score++;
+
+    // 7) EMA9/21 confluence with direction
+    if(direction==='UP' && ema9 > ema21) score++;
+    if(direction==='DOWN' && ema9 < ema21) score++;
+
+    // 8) RSI safe zone (avoid extremes), improved thresholds slightly adaptive to ATR volatility
+    const rsiUpper = 70 + Math.min(6, Math.round(atr/2)); // allow slightly higher in volatile market
+    const rsiLower = 30 - Math.min(6, Math.round(atr/2));
+    if(direction==='UP' && rsi < rsiUpper) score++;
+    if(direction==='DOWN' && rsi > rsiLower) score++;
+
+    // 9) BOS/CHOCH structural check (extra confluence but not required)
+    const bos = checkBOSCHOCH(direction);
+    if(bos) score++;
+
+    // final decision - require minimum score 5 (or 6 for extra strictness)
+    const required = 5;
+    const now = Date.now()/1000;
+    const cooldownSec = (cooldownMinutes || 45) * 60;
+
+    if(score >= required && direction && (force || direction !== lastSignalDir || (now - lastSignalTime) > cooldownSec)) {
+        // compute SL/TP using ATR
+        const slDistance = Math.max(atr*0.8, (curr.h - curr.l)*0.7); // avoid tiny SL
+        const sl = direction==='UP' ? (curr.o - slDistance) : (curr.o + slDistance);
+        const tp1 = direction==='UP' ? (curr.o + slDistance*2) : (curr.o - slDistance*2);
+        lastSignalDir = direction;
+        lastSignalTime = now;
+        showSignal(direction, curr.o.toFixed(2), score, sl.toFixed(2), tp1.toFixed(2));
+        sendTelegram(direction, curr.o.toFixed(2), score, sl.toFixed(2), tp1.toFixed(2));
+        document.getElementById('boom').play();
+    } else {
+        document.getElementById('st').textContent = `Status: No strong signal (score ${score}/8) - last ${lastSignalDir || 'NONE'}`;
+    }
+}
+
+/* Improved OB detection:
+   - scans last 60 candles
+   - looks for clear bullish/bearish OB pattern: big directional candle followed by 2-3 opposite candles
+   - returns a range {high, low, index, type}
+*/
+function findOBImproved() {
+    for(let i = h1.length-20; i > 5; i--) {
+        const A = h1[i], B = h1[i-1], C = h1[i-2];
+        const range = A.h - A.l;
+        // bullish OB: A strong bullish candle then 2 bearish candles
+        if(A.c > A.o && B.c < B.o && C.c < C.o && range > mean(h1.slice(i-8,i+1).map(x=>x.h - x.l))*1.05) {
+            const high = Math.max(A.h, B.h, C.h);
+            const low = Math.min(A.l, B.l, C.l);
+            return {high, low, idx:i, type:'bullish', range};
+        }
+        // bearish OB
+        if(A.c < A.o && B.c > B.o && C.c > C.o && range > mean(h1.slice(i-8,i+1).map(x=>x.h - x.l))*1.05) {
+            const high = Math.max(A.h, B.h, C.h);
+            const low = Math.min(A.l, B.l, C.l);
+            return {high, low, idx:i, type:'bearish', range};
+        }
+    }
+    return null;
+}
+
+/* Improved FVG: checks 3-candle gap and measures depth */
+function findFVGImproved() {
+    if(h1.length < 5) return null;
+    for(let i = h1.length-4; i > 3; i--) {
+        const A = h1[i-2], B = h1[i-1], C = h1[i];
+        // up FVG: A.h < C.l => gap between A and C
+        if(A.h < C.l) {
+            const depth = C.l - A.h;
+            return {side:'UP', depth, from:A.h, to:C.l, idx:i-2};
+        }
+        if(A.l > C.h) {
+            const depth = A.l - C.h;
+            return {side:'DOWN', depth, from:C.h, to:A.l, idx:i-2};
+        }
+    }
+    return null;
+}
+
+/* BOS/CHOCH check - quick heuristic:
+   - For UP: check if last 3 swings show higher highs and higher lows, or recently broken structure
+   - For DOWN: inverse
+*/
+function checkBOSCHOCH(direction) {
+    try {
+        // build simple swing highs/lows from last 30 candles
+        const last = h1.slice(-40);
+        const swings = [];
+        for(let i=2;i<last.length-2;i++){
+            if(last[i].h > last[i-1].h && last[i].h > last[i+1].h) swings.push({type:'H', val:last[i].h, idx:i});
+            if(last[i].l < last[i-1].l && last[i].l < last[i+1].l) swings.push({type:'L', val:last[i].l, idx:i});
+        }
+        if(swings.length < 4) return false;
+        // basic pattern detection
+        if(direction==='UP') {
+            // need recent higher high vs previous swing high
+            const highs = swings.filter(s=>s.type==='H').map(s=>s.val);
+            if(highs.length < 2) return false;
+            return highs[highs.length-1] > highs[highs.length-2];
+        } else {
+            const lows = swings.filter(s=>s.type==='L').map(s=>s.val);
+            if(lows.length < 2) return false;
+            return lows[lows.length-1] < lows[lows.length-2];
+        }
+    } catch(e){ return false; }
+}
+
+/* UI popup */
+function showSignal(dir, price, scr, sl, tp) {
+    const el = document.getElementById('predict');
+    el.innerHTML = `<div style="text-align:center">${dir} → ${scr}/8<br>Entry ${price}<br>SL ${sl} | TP ${tp}</div>`;
+    el.className = dir==='UP'?'up':'down';
+    el.style.display = 'block';
+    setTimeout(()=>el.style.display='none', 35000);
+}
+
+/* Telegram sender with retries */
+async function sendTelegram(dir, price, score, sl, tp) {
+    const msg = `*XAUUSD 1H SMC SIGNAL (Improved)*\n\n` +
+                `*Next Candle:* ${dir==='UP'?'BULLISH':'BEARISH'}\n` +
+                `*Confirmed Filters:* ${score}/8\n` +
+                `*Entry:* ${price}\n` +
+                `*SL:* ${sl}\n` +
+                `*TP:* ${tp}\n` +
+                `*Time:* ${new Date().toLocaleString()}\n\nTrade Smart!`;
+    const body = {chat_id:cfg.chat, text:msg, parse_mode:'Markdown', disable_web_page_preview:true};
+    try {
+        await fetchWithRetry(`https://api.telegram.org/bot${cfg.token}/sendMessage`, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}, 4, 900);
+        document.getElementById('st').textContent = `Status: Signal sent ${dir} (${score}/8)`;
+    } catch(e) {
+        console.error('Telegram send failed', e);
+        document.getElementById('st').textContent = 'Status: Signal READY but Telegram failed';
+    }
+}
+</script>
+</body>
+</html>
